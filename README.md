@@ -7,6 +7,8 @@ We have included a C++ in-memory assembler library `xbyak`, that can be
 used for code generation. The JIT must generated x86-64 assembly code for 
 Linux.
 
+The project description and specifications of Project 3B can be found at the website [here](https://www.cs.cmu.edu/~wasm/cs17-770/fall2025/proj3b.html).
+
 ## Starter Code
 
 The starter code provided is essentially the same as Project 1, with an additional
@@ -31,7 +33,5 @@ as opposed to interpretation, and the `-a` argument from earler to pass paramete
 We will grade your JIT with the same test cases from Project 1; these have
 already been made available to you, and are present in the `tests` directory.
 
-Submit your code to Canvas (URL to the private repo) and add the TA (Github ID: arjunr2) 
-as a collaborator to the repo. Include any notes about the branch that contains the code
-as a comment in the Canvas submission.
+Submit your code to Gradescope.
 
