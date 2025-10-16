@@ -65,6 +65,8 @@ struct CustomDecl {
 struct SigDecl {
   typelist params;
   typelist results;
+  uint32_t num_params;
+  uint32_t num_results;
 
   bool operator==(const SigDecl &sig) {
     bool parameq = std::equal(this->params.begin(), this->params.end(),
@@ -243,6 +245,7 @@ class WasmModule {
     inline TableDecl* getTable(uint32_t idx)    { return GET_LIST_ELEM(this->tables, idx); }
     inline MemoryDecl* getMemory(uint32_t idx)  { return GET_LIST_ELEM(this->mems, idx); }
     inline DataDecl* getData(uint32_t idx)      { return GET_LIST_ELEM(this->datas, idx); }
+    inline ElemDecl* getElems(uint32_t idx)     { return GET_LIST_ELEM(this->elems, idx); }
     inline ImportDecl* getImport(uint32_t idx)  { return GET_LIST_ELEM(this->imports.list, idx); }
 
     /* Index Accessors */
@@ -254,6 +257,11 @@ class WasmModule {
     inline uint32_t getDataIdx(DataDecl *data)        const { return GET_LIST_IDX(this->datas, data); }
     inline uint32_t getImportIdx(ImportDecl *import)  const { return GET_LIST_IDX(this->imports.list, import); }
 
+    inline uint32_t getDataSize()   { return datas.size(); }
+    inline uint32_t getMemorySize() { return mems.size(); }
+    inline uint32_t getElemsSize()  { return elems.size(); }
+    inline uint32_t getTableSize()  { return tables.size(); }
+
     /* Import accessors */
     inline bool isImport(FuncDecl *func)      { return getFuncIdx(func)     < this->imports.num_funcs; }
     inline bool isImport(GlobalDecl *global)  { return getGlobalIdx(global) < this->imports.num_globals; }
@@ -264,6 +272,7 @@ class WasmModule {
     inline std::deque <FuncDecl> &Funcs() { return this->funcs; }
     inline std::deque <GlobalDecl> &Globals() { return this->globals; }
     inline std::list  <ExportDecl> &Exports() { return this->exports; }
+    inline ImportSet  &Imports() { return this->imports; }
 
     inline FuncDecl* get_start_fn() { return this->start_fn; }
     inline uint32_t get_num_customs() { return this->customs.size(); }

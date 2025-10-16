@@ -123,6 +123,7 @@ static bytearr decode_init_expr(buffer_t &buf) {
 
 void WasmModule::decode_type_section(buffer_t &buf, uint32_t len) {
   uint32_t num_sigs = RD_U32();
+  TRACE("Number of function signatures is %d!\n", num_sigs);
   for (uint32_t i = 0; i < num_sigs; i++) {
     SigDecl sig;
     /* Read type */
@@ -133,9 +134,12 @@ void WasmModule::decode_type_section(buffer_t &buf, uint32_t len) {
 
     /* For params */
     uint32_t num_params = RD_U32();
+    TRACE("Setting sig %d to have %d params!\n", i, num_params);
+    sig.num_params = num_params;
     sig.params = read_type_list(num_params, buf);
     /* For results */
     uint32_t num_results = RD_U32();
+    sig.num_results = num_results;
     sig.results = read_type_list(num_results, buf);
     
     this->sigs.push_back(sig);
