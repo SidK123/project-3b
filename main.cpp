@@ -5,8 +5,12 @@
 #include <cstring>
 #include <getopt.h>
 #include <numeric>
+#include <stack>
+#include <variant>
+#include <math.h>
 #include <bit>
 
+#include "jit.h"
 #include "common.h"
 #include "parse.h"
 #include "ir.h"
@@ -198,9 +202,7 @@ double load_f64(uint32_t address) {
   for (int i = 0; i < 8; i++) {
     int_result |= (static_cast<uint64_t>(memory.memory_array[address + i]) << (8 * i));
   }
-  TRACE("Result loaded in i64 form is %llu.\n", int_result);
   double result = std::bit_cast<double>(int_result);
-  TRACE("Result returned in double form is %f.\n", result);
   return result;
 }
 
@@ -1059,7 +1061,6 @@ void instruction_execution(WasmModule& module, int function_index, std::vector<b
       case WASM_OP_GLOBAL_SET: {
         uint32_t idx = RD_U32();
         std::get<2>(global_to_value_map[idx]) = value_stack.top();
-        TRACE("Setting global to value %d!\n", value_stack.top());
         value_stack.pop();
         break;
       }
@@ -1547,7 +1548,11 @@ int main(int argc, char *argv[]) {
   unload_file(&start, &end);
   
   /* Interpreter here */
-  interpreter(module, args.mainargs);
+  if (args.jit_compiled) {
+    jit(module, args.mainargs);
+  } else {
+    interpreter(module, args.mainargs);
+  }
   /* */
   return 0;
 }
