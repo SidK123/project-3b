@@ -26,6 +26,8 @@ using JitEntry = int (*)();
 using DoubleJitEntry = double (*)();
 using VoidJitEntry = void (*)();
 
+void* mem_base_ptr;
+
 int get_func_stack_size(int function_index, WasmModule& module) {
   FuncDecl* func = module.getFunc(function_index);
   auto code   = func->code_bytes;
@@ -103,6 +105,22 @@ int get_func_stack_size(int function_index, WasmModule& module) {
       case WASM_OP_CALL: {
         uint32_t called_function_idx = RD_U32();
         stack_size += (module.getFunc(called_function_idx)->sig->num_results - module.getFunc(called_function_idx)->sig->num_params);
+        break;
+      }
+      case WASM_OP_I32_STORE16:
+      case WASM_OP_I32_STORE8:
+      case WASM_OP_I32_STORE: {
+        RD_U32();
+        RD_U32();
+        break;
+      }
+      case WASM_OP_I32_LOAD16_S:
+      case WASM_OP_I32_LOAD16_U:
+      case WASM_OP_I32_LOAD8_U:
+      case WASM_OP_I32_LOAD8_S:
+      case WASM_OP_I32_LOAD: {
+        RD_U32();
+        RD_U32();
         break;
       }
       default: {
@@ -372,6 +390,82 @@ void wasm_to_x86_loop(Code* fn_asm, int function_index, WasmModule& module) {
         fn_asm->mov(Xbyak::util::r13, Xbyak::util::ptr [Xbyak::util::rbx + 8]);
         fn_asm->mov(Xbyak::util::qword [Xbyak::util::r12 - const_arg * 8], Xbyak::util::r13);
         fn_asm->add(Xbyak::util::rbx, 8);
+        break;
+      }
+      case WASM_OP_I32_LOAD8_S: {
+        uint32_t align = RD_U32();
+        uint32_t offset = RD_U32();
+        fn_asm->mov(Xbyak::util::r13, (uintptr_t)mem_base_ptr);
+        fn_asm->mov(Xbyak::util::r14, Xbyak::util::ptr [Xbyak::util::rbx + 8]);
+        fn_asm->add(Xbyak::util::rbx, 8);
+        fn_asm->add(Xbyak::util::r13, Xbyak::util::r14);
+        fn_asm->mov(Xbyak::util::rax, 0);
+        fn_asm->mov(Xbyak::util::al, Xbyak::util::byte [Xbyak::util::r13 + offset]);
+        fn_asm->cbw();
+        fn_asm->cwde();
+        fn_asm->mov(Xbyak::util::qword [Xbyak::util::rbx], Xbyak::util::rax);
+        fn_asm->sub(Xbyak::util::rbx, 8);
+        break;
+      }
+      case WASM_OP_I32_LOAD8_U: {
+        uint32_t align = RD_U32();
+        uint32_t offset = RD_U32();
+        fn_asm->mov(Xbyak::util::r13, (uintptr_t)mem_base_ptr);
+        fn_asm->mov(Xbyak::util::r14, Xbyak::util::ptr [Xbyak::util::rbx + 8]);
+        fn_asm->add(Xbyak::util::rbx, 8);
+        fn_asm->add(Xbyak::util::r13, Xbyak::util::r14);
+        fn_asm->mov(Xbyak::util::rax, 0);
+        fn_asm->mov(Xbyak::util::al, Xbyak::util::byte [Xbyak::util::r13 + offset]);
+        fn_asm->mov(Xbyak::util::qword [Xbyak::util::rbx], Xbyak::util::rax);
+        fn_asm->sub(Xbyak::util::rbx, 8);
+        break;
+      }
+      case WASM_OP_I32_LOAD: {
+        uint32_t align = RD_U32();
+        uint32_t offset = RD_U32();
+        fn_asm->mov(Xbyak::util::r13, (uintptr_t)mem_base_ptr);
+        fn_asm->mov(Xbyak::util::r14, Xbyak::util::ptr [Xbyak::util::rbx + 8]);
+        fn_asm->add(Xbyak::util::rbx, 8);
+        fn_asm->add(Xbyak::util::r13, Xbyak::util::r14);
+        fn_asm->mov(Xbyak::util::r13d, Xbyak::util::dword [Xbyak::util::r13 + offset]);
+        fn_asm->mov(Xbyak::util::qword [Xbyak::util::rbx], Xbyak::util::r13);
+        fn_asm->sub(Xbyak::util::rbx, 8);
+        break;
+      } 
+      case WASM_OP_I32_STORE8: {
+        uint32_t align = RD_U32();
+        uint32_t offset = RD_U32();
+        fn_asm->mov(Xbyak::util::r13, (uintptr_t)mem_base_ptr);
+        fn_asm->mov(Xbyak::util::r14, Xbyak::util::ptr [Xbyak::util::rbx + 16]); // Address
+        fn_asm->mov(Xbyak::util::r15, Xbyak::util::ptr [Xbyak::util::rbx + 8]); // Value
+        fn_asm->add(Xbyak::util::rbx, 16); 
+        fn_asm->add(Xbyak::util::r13, Xbyak::util::r14);
+        fn_asm->mov(Xbyak::util::byte [Xbyak::util::r13 + offset], Xbyak::util::r15b);
+        fn_asm->sub(Xbyak::util::rbx, 8);
+        break;
+      }
+      case WASM_OP_I32_STORE16: {
+        uint32_t align = RD_U32();
+        uint32_t offset = RD_U32();
+        fn_asm->mov(Xbyak::util::r13, (uintptr_t)mem_base_ptr);
+        fn_asm->mov(Xbyak::util::r14, Xbyak::util::ptr [Xbyak::util::rbx + 16]); // Address
+        fn_asm->mov(Xbyak::util::r15, Xbyak::util::ptr [Xbyak::util::rbx + 8]); // Value
+        fn_asm->add(Xbyak::util::rbx, 16); 
+        fn_asm->add(Xbyak::util::r13, Xbyak::util::r14);
+        fn_asm->mov(Xbyak::util::word [Xbyak::util::r13 + offset], Xbyak::util::r15w);
+        fn_asm->sub(Xbyak::util::rbx, 8);
+        break;
+      }
+      case WASM_OP_I32_STORE: {
+        uint32_t align = RD_U32();
+        uint32_t offset = RD_U32();
+        fn_asm->mov(Xbyak::util::r13, (uintptr_t)mem_base_ptr);
+        fn_asm->mov(Xbyak::util::r14, Xbyak::util::ptr [Xbyak::util::rbx + 16]); // Address
+        fn_asm->mov(Xbyak::util::r15, Xbyak::util::ptr [Xbyak::util::rbx + 8]); // Value
+        fn_asm->add(Xbyak::util::rbx, 16); 
+        fn_asm->add(Xbyak::util::r13, Xbyak::util::r14);
+        fn_asm->mov(Xbyak::util::dword [Xbyak::util::r13 + offset], Xbyak::util::r15);
+        fn_asm->sub(Xbyak::util::rbx, 8);
         break;
       }
       case WASM_OP_I32_ADD: {
@@ -667,6 +761,23 @@ void jit(WasmModule& module, std::vector<std::string>& args) {
     FuncDecl* main_fn = find_main_function(module);
     int main_fn_idx = module.getFuncIdx(main_fn);
 
+    if (module.getMemorySize() > 0) {
+      auto mem_list = module.getMemory(0);
+      TRACE("Memory initial: %d!\n", mem_list->limits.initial);
+      TRACE("Memory max: %d!\n", mem_list->limits.max);
+      mem_base_ptr = calloc(static_cast<size_t>(mem_list->limits.initial) * 65536, sizeof(char));
+    } 
+
+    if (module.getDataSize() > 0) {
+    for (int j = 0; j < module.getDataSize(); j++) {
+      auto data_list = module.getData(j);
+      for (int i = 0; i < data_list->bytes.size(); i++) {
+          char* mem_arr = static_cast<char*>(mem_base_ptr);
+          mem_arr[data_list->mem_offset + i] = data_list->bytes[i];
+        }
+      }
+    }
+
     for (int i = 0; i < module.Funcs().size(); i++) {
       Xbyak::Label new_label;
       function_header_labels.push_back(new_label);
@@ -685,10 +796,9 @@ void jit(WasmModule& module, std::vector<std::string>& args) {
 
     try {
       result = fn();                          
-    } catch (const Xbyak::Error& e) {
-      return;
     } catch (...) {
-      std::cerr << "Caught an unknown exception." << std::endl;
+      std::cerr << "!trap" << std::endl;
+      return;
     }
     std::cout << result << "\n"; 
 }
