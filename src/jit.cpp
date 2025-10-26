@@ -123,11 +123,15 @@ int get_func_stack_size(int function_index, WasmModule& module) {
         break;
       }
       case WASM_OP_CALL_INDIRECT: {
-        // int max_args = -1;
-        // for (int i = 0; i < jit_table.num_entries; i++) {
-          // jit_table.func_refs[i]
-        // }
-        stack_size += 10;
+        int max_args = -1;
+        for (int i = 0; i < jit_table.num_entries; i++) {
+          if (jit_table.func_refs[i] != -1) {
+            if (module.getFunc(jit_table.func_refs[i])->sig->num_params > max_args) {
+              max_args = module.getFunc(jit_table.func_refs[i])->sig->num_params;
+            }
+          }
+        }
+        stack_size += max_args;
         break;
       }
       case WASM_OP_F64_STORE:
@@ -157,7 +161,6 @@ int get_func_stack_size(int function_index, WasmModule& module) {
       }
     }
   }
-  fn_to_stack_size[function_index] = stack_size;
   return stack_size;
 }
 
@@ -168,6 +171,14 @@ void add_fn_prologue(Code* fn_asm, int function_index, WasmModule& module) {
   auto num_locals = module.getFunc(function_index)->num_pure_locals;
   auto stack_size = get_func_stack_size(function_index, module);
 
+  int alloc_size = params + num_locals + stack_size;
+
+  if (alloc_size % 2 == 0) {
+    alloc_size += 1;
+  }
+
+  fn_to_stack_size[function_index] = alloc_size;
+
   fn_asm->L(function_header_labels[function_index]);
   fn_asm->push(rbp); 
   fn_asm->mov(rbp, rsp);
@@ -176,7 +187,7 @@ void add_fn_prologue(Code* fn_asm, int function_index, WasmModule& module) {
   fn_asm->push(r13); 
   fn_asm->push(r14); 
   fn_asm->push(r15);
-  fn_asm->sub(rsp, (stack_size + params + num_locals) * 8);
+  fn_asm->sub(rsp, (alloc_size) * 8);
   fn_asm->lea(rbx, ptr[rsp + ((stack_size + params + num_locals) * 8) - 8]);
   fn_asm->lea(r12, ptr[rsp + ((stack_size + params + num_locals) * 8) - 8]);
 
@@ -186,11 +197,9 @@ void add_fn_prologue(Code* fn_asm, int function_index, WasmModule& module) {
 void add_fn_epilogue(Code* fn_asm, int function_index, WasmModule& module) {
   using namespace Xbyak::util;
 
-  auto params = module.getFunc(function_index)->sig->num_params;
-  auto num_locals = module.getFunc(function_index)->num_pure_locals;
-  auto stack_size = fn_to_stack_size[function_index];
+  auto alloc_size = fn_to_stack_size[function_index];
 
-  fn_asm->add(rsp, (stack_size + params + num_locals) * 8);
+  fn_asm->add(rsp, (alloc_size) * 8);
   fn_asm->pop(r15); 
   fn_asm->pop(r14); 
   fn_asm->pop(r13); 
@@ -324,8 +333,15 @@ void store_args(Code* fn_asm, int function_index, WasmModule& module, std::vecto
     }
   }
 
+  int rsp_push_size = std::max(0, (int)(args.size()) - 6);
+
+  if (args.size() % 2 == 0) {
+    rsp_push_size += 1; 
+    fn_asm->sub(Xbyak::util::rsp, 8);
+  }
+
   fn_asm->call(function_header_labels[function_index]);
-  fn_asm->add(Xbyak::util::rsp, std::max(0, static_cast<int>(args.size())- 6) * 8);
+  fn_asm->add(Xbyak::util::rsp, rsp_push_size * 8);
   fn_asm->pop(r15); 
   fn_asm->pop(r14); 
   fn_asm->pop(r13); 
@@ -411,8 +427,16 @@ void wasm_to_x86_loop(Code* fn_asm, int function_index, WasmModule& module) {
         uint32_t called_function_idx = RD_U32(); 
         const auto& called_label = function_header_labels[called_function_idx];
         int num_spilled_args = store_args_to_call(fn_asm, module.getSigIdx(module.getFunc(called_function_idx)->sig), module);
+        int rsp_offset = 0;
+
+        if (num_spilled_args % 2 == 0 && fn_to_stack_size[function_index] % 2 == 0 || 
+            num_spilled_args % 2 == 1 && fn_to_stack_size[function_index] % 2 == 1) {
+          fn_asm->sub(Xbyak::util::rsp, 8);
+          rsp_offset = 1;
+        }        
+
         fn_asm->call(called_label);
-        fn_asm->add(Xbyak::util::rsp, num_spilled_args * 8);
+        fn_asm->add(Xbyak::util::rsp, (num_spilled_args + rsp_offset) * 8);
         fn_asm->mov(Xbyak::util::qword [Xbyak::util::rbx], Xbyak::util::rax);
         fn_asm->sub(Xbyak::util::rbx, 8);
         break;
@@ -439,9 +463,17 @@ void wasm_to_x86_loop(Code* fn_asm, int function_index, WasmModule& module) {
         fn_asm->mov(Xbyak::util::r15, (uintptr_t)(fn_entry_ptr));
         fn_asm->lea(Xbyak::util::r13, Xbyak::util::ptr[Xbyak::util::r15 + Xbyak::util::r13 * 8]); // R13 now contains the pointer to the function function index. 
         fn_asm->mov(Xbyak::util::r15, Xbyak::util::qword [Xbyak::util::r13]); 
+
         int num_spilled_args = store_args_to_call(fn_asm, type_index, module);
+        int rsp_offset = 0;
+        if (num_spilled_args % 2 == 0 && fn_to_stack_size[function_index] % 2 == 0 || 
+            num_spilled_args % 2 == 1 && fn_to_stack_size[function_index] % 2 == 1) {
+          fn_asm->sub(Xbyak::util::rsp, 8);
+          rsp_offset = 1;
+        }
+
         fn_asm->call(Xbyak::util::r15);
-        fn_asm->add(Xbyak::util::rsp, num_spilled_args * 8);
+        fn_asm->add(Xbyak::util::rsp, (num_spilled_args + rsp_offset) * 8);
         fn_asm->mov(Xbyak::util::qword [Xbyak::util::rbx], Xbyak::util::rax);
         fn_asm->sub(Xbyak::util::rbx, 8);
         break;
