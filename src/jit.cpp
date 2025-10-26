@@ -28,8 +28,6 @@ std::unordered_map<int, int> fn_to_stack_size;
 extern FuncDecl* find_main_function(WasmModule& module);
 
 using JitEntry = uint64_t (*)();
-using DoubleJitEntry = double (*)();
-using VoidJitEntry = void (*)();
 
 typedef struct Table {
   int  num_entries;
@@ -37,8 +35,9 @@ typedef struct Table {
 } Table;
 
 Table jit_table;
-int* globals;
+uint64_t* globals;
 void* mem_base_ptr;
+uint32_t* mem_size; 
 const void** fn_entry_ptr; 
 int* fn_sig_id;
 
@@ -102,6 +101,7 @@ int get_func_stack_size(int function_index, WasmModule& module) {
         RD_U32();
         break;
       }
+      case WASM_OP_GLOBAL_SET:
       case WASM_OP_LOCAL_SET: {
         RD_U32();
         break;
@@ -111,6 +111,7 @@ int get_func_stack_size(int function_index, WasmModule& module) {
         stack_size++;
         break;
       }
+      case WASM_OP_GLOBAL_GET:
       case WASM_OP_LOCAL_GET: {
         RD_U32();
         stack_size++;
@@ -129,6 +130,7 @@ int get_func_stack_size(int function_index, WasmModule& module) {
         stack_size += 10;
         break;
       }
+      case WASM_OP_F64_STORE:
       case WASM_OP_I32_STORE16:
       case WASM_OP_I32_STORE8:
       case WASM_OP_I32_STORE: {
@@ -136,6 +138,7 @@ int get_func_stack_size(int function_index, WasmModule& module) {
         RD_U32();
         break;
       }
+      case WASM_OP_F64_LOAD:
       case WASM_OP_I32_LOAD16_S:
       case WASM_OP_I32_LOAD16_U:
       case WASM_OP_I32_LOAD8_U:
@@ -267,6 +270,11 @@ void load_args(Code* fn_asm, int function_index, WasmModule& module) {
       }
     }
   }
+  for (int i = 0; i < module.getFunc(function_index)->num_pure_locals; i++) {
+    fn_asm->mov(Xbyak::util::qword [Xbyak::util::rbx], 0);
+    fn_asm->sub(Xbyak::util::rbx, 8);
+  }
+  fn_asm->sub(Xbyak::util::rbx, 8);
 
   TRACE("Out of loading args stage!\n");
 }
@@ -358,7 +366,8 @@ typedef enum ctrl_flow_block_t {
 } ctrl_flow_block_t; 
 
 typedef struct control_flow_label_t {
-  Xbyak::Label label;
+  Xbyak::Label branch_label;
+  Xbyak::Label else_label;
   ctrl_flow_block_t block_type; 
 } control_flow_label_t;
 
@@ -369,7 +378,7 @@ void wasm_to_x86_loop(Code* fn_asm, int function_index, WasmModule& module) {
   control_flow_label_t fn_label;
   Xbyak::Label base_fn_label;
   fn_label.block_type = FUNCTION;
-  fn_label.label = base_fn_label;
+  fn_label.branch_label = base_fn_label;
   label_stack.push_front(fn_label);
 
   fn_asm->nop();
@@ -385,18 +394,17 @@ void wasm_to_x86_loop(Code* fn_asm, int function_index, WasmModule& module) {
   while (buf.ptr != buf.end) {
     auto opcode = RD_OPCODE();
     switch (opcode) {
+      case WASM_OP_UNREACHABLE: {
+        fn_asm->jmp(error_labels[function_index]);
+        break;
+      }
+      case WASM_OP_NOP: {
+        fn_asm->nop();
+        break;
+      }
       case WASM_OP_RETURN: {
         move_ret_val(fn_asm, function_index, module);
         add_fn_epilogue(fn_asm, function_index, module);
-        break;
-      }
-      case WASM_OP_BLOCK: {
-        RD_U32();
-        control_flow_label_t new_label;
-        new_label.block_type = BLOCK;
-        Xbyak::Label new_block_label;
-        new_label.label = new_block_label;
-        label_stack.push_front(new_label);
         break;
       }
       case WASM_OP_CALL: {
@@ -444,16 +452,49 @@ void wasm_to_x86_loop(Code* fn_asm, int function_index, WasmModule& module) {
         Xbyak::Label new_loop_label;
 
         new_label.block_type = LOOP;
-        new_label.label = new_loop_label;
+        new_label.branch_label = new_loop_label;
 
-        fn_asm->L(new_label.label);
+        fn_asm->L(new_label.branch_label);
         label_stack.push_front(new_label);
+        break;
+      }
+      case WASM_OP_BLOCK: {
+        RD_U32();
+        control_flow_label_t new_label;
+        new_label.block_type = BLOCK;
+        Xbyak::Label new_block_label;
+        new_label.branch_label = new_block_label;
+        label_stack.push_front(new_label);
+        break;
+      }
+      case WASM_OP_IF: {
+        RD_U32();
+        control_flow_label_t new_label;
+        Xbyak::Label new_if_label;
+        Xbyak::Label new_end_label;
+        new_label.block_type = IF_NO_ELSE; 
+        new_label.else_label = new_if_label;
+        new_label.branch_label = new_end_label;
+        label_stack.push_front(new_label);
+        fn_asm->mov(Xbyak::util::r13, Xbyak::util::qword [Xbyak::util::rbx + 8]);
+        fn_asm->add(Xbyak::util::rbx, 8);
+        fn_asm->cmp(Xbyak::util::r13, 0);
+        const auto& label = label_stack[0];
+        fn_asm->je(label.else_label, fn_asm->T_NEAR); // To go to the ELSE.
+        break;
+      }
+      case WASM_OP_ELSE: {
+        Xbyak::Label new_else_label;
+        const auto& label = label_stack[0];
+        label_stack[0].block_type = IF_WITH_ELSE;
+        fn_asm->jmp(label.branch_label, fn_asm->T_NEAR);
+        fn_asm->L(label_stack[0].else_label);
         break;
       }
       case WASM_OP_BR: {
         uint32_t label = RD_U32();
         const auto& jump_label = label_stack[label];
-        fn_asm->jmp(jump_label.label, fn_asm->T_NEAR);
+        fn_asm->jmp(jump_label.branch_label, fn_asm->T_NEAR);
         break;
       }
       case WASM_OP_BR_IF: {
@@ -462,7 +503,7 @@ void wasm_to_x86_loop(Code* fn_asm, int function_index, WasmModule& module) {
         fn_asm->mov(Xbyak::util::r13, Xbyak::util::ptr [Xbyak::util::rbx + 8]);
         fn_asm->add(Xbyak::util::rbx, 8);
         fn_asm->cmp(Xbyak::util::r13, 0);
-        fn_asm->jne(jump_label.label, fn_asm->T_NEAR);
+        fn_asm->jne(jump_label.branch_label, fn_asm->T_NEAR);
         break;
       }
       case WASM_OP_BR_TABLE: {
@@ -476,18 +517,39 @@ void wasm_to_x86_loop(Code* fn_asm, int function_index, WasmModule& module) {
         fn_asm->mov(Xbyak::util::r13, Xbyak::util::ptr [Xbyak::util::rbx + 8]);
         fn_asm->add(Xbyak::util::rbx, 8);
         for (int i = 0; i < number_of_labels; i++) {
-          fn_asm->cmp(Xbyak::util::r13, i); fn_asm->je(label_stack[table_labels[i]].label, fn_asm->T_NEAR);
+          fn_asm->cmp(Xbyak::util::r13, i); fn_asm->je(label_stack[table_labels[i]].branch_label, fn_asm->T_NEAR);
         }
-        fn_asm->jmp(label_stack[default_label].label, fn_asm->T_NEAR);
+        fn_asm->jmp(label_stack[default_label].branch_label, fn_asm->T_NEAR);
         break;
       }
       case WASM_OP_END: {
         control_flow_label_t patched_label = label_stack.front();
         if (patched_label.block_type != LOOP) {
-          fn_asm->L(patched_label.label);
+          if (patched_label.block_type == IF_NO_ELSE) {
+            fn_asm->L(patched_label.else_label);
+          }
+          fn_asm->L(patched_label.branch_label);
         }
         label_stack.pop_front();
         break; 
+      }
+      case WASM_OP_SELECT: {
+        fn_asm->mov(Xbyak::util::r13d, Xbyak::util::qword [Xbyak::util::rbx + 8]);
+        fn_asm->mov(Xbyak::util::r14d, Xbyak::util::qword [Xbyak::util::rbx + 16]);
+        fn_asm->mov(Xbyak::util::r15d, Xbyak::util::qword [Xbyak::util::rbx + 24]);
+        fn_asm->add(Xbyak::util::rbx, 24);
+        fn_asm->mov(Xbyak::util::qword [Xbyak::util::rbx], Xbyak::util::r15d);
+        fn_asm->cmp(Xbyak::util::r13d, 0);
+        fn_asm->cmovge(Xbyak::util::r14, Xbyak::util::r15);
+        fn_asm->mov(Xbyak::util::qword [Xbyak::util::rbx], Xbyak::util::r14);
+        fn_asm->sub(Xbyak::util::rbx, 8);
+        break;
+      }
+      case WASM_OP_LOCAL_TEE: {
+        int const_arg = RD_U32();
+        fn_asm->mov(Xbyak::util::r13, Xbyak::util::ptr [Xbyak::util::rbx + 8]);
+        fn_asm->mov(Xbyak::util::qword [Xbyak::util::r12 - const_arg * 8], Xbyak::util::r13);
+        break;
       }
       case WASM_OP_I32_CONST: {
         int const_arg = RD_I32(); 
@@ -512,12 +574,19 @@ void wasm_to_x86_loop(Code* fn_asm, int function_index, WasmModule& module) {
       case WASM_OP_I32_LOAD8_S: {
         uint32_t align = RD_U32();
         uint32_t offset = RD_U32();
-        fn_asm->mov(Xbyak::util::r13, (uintptr_t)mem_base_ptr);
         fn_asm->mov(Xbyak::util::r14, Xbyak::util::ptr [Xbyak::util::rbx + 8]);
         fn_asm->add(Xbyak::util::rbx, 8);
+        fn_asm->add(Xbyak::util::r14d, offset);
+        fn_asm->jc(error_labels[function_index], fn_asm->T_NEAR);
+        fn_asm->mov(Xbyak::util::r15, (uintptr_t)mem_size);
+        fn_asm->mov(Xbyak::util::r15, Xbyak::util::qword [Xbyak::util::r15]);
+        fn_asm->sub(Xbyak::util::r15, 1);
+        fn_asm->cmp(Xbyak::util::r14d, Xbyak::util::r15d);
+        fn_asm->ja(error_labels[function_index], fn_asm->T_NEAR);
+        fn_asm->mov(Xbyak::util::r13, (uintptr_t)mem_base_ptr);
         fn_asm->add(Xbyak::util::r13, Xbyak::util::r14);
         fn_asm->mov(Xbyak::util::rax, 0);
-        fn_asm->mov(Xbyak::util::al, Xbyak::util::byte [Xbyak::util::r13 + offset]);
+        fn_asm->mov(Xbyak::util::al, Xbyak::util::byte [Xbyak::util::r13]);
         fn_asm->cbw();
         fn_asm->cwde();
         fn_asm->mov(Xbyak::util::qword [Xbyak::util::rbx], Xbyak::util::rax);
@@ -527,12 +596,19 @@ void wasm_to_x86_loop(Code* fn_asm, int function_index, WasmModule& module) {
       case WASM_OP_I32_LOAD8_U: {
         uint32_t align = RD_U32();
         uint32_t offset = RD_U32();
-        fn_asm->mov(Xbyak::util::r13, (uintptr_t)mem_base_ptr);
         fn_asm->mov(Xbyak::util::r14, Xbyak::util::ptr [Xbyak::util::rbx + 8]);
         fn_asm->add(Xbyak::util::rbx, 8);
+        fn_asm->add(Xbyak::util::r14d, offset);
+        fn_asm->jc(error_labels[function_index], fn_asm->T_NEAR);
+        fn_asm->mov(Xbyak::util::r15, (uintptr_t)mem_size);
+        fn_asm->mov(Xbyak::util::r15, Xbyak::util::qword [Xbyak::util::r15]);
+        fn_asm->sub(Xbyak::util::r15, 1);
+        fn_asm->cmp(Xbyak::util::r14d, Xbyak::util::r15d);
+        fn_asm->ja(error_labels[function_index], fn_asm->T_NEAR);
+        fn_asm->mov(Xbyak::util::r13, (uintptr_t)mem_base_ptr);
         fn_asm->add(Xbyak::util::r13, Xbyak::util::r14);
         fn_asm->mov(Xbyak::util::rax, 0);
-        fn_asm->mov(Xbyak::util::al, Xbyak::util::byte [Xbyak::util::r13 + offset]);
+        fn_asm->mov(Xbyak::util::al, Xbyak::util::byte [Xbyak::util::r13]);
         fn_asm->mov(Xbyak::util::qword [Xbyak::util::rbx], Xbyak::util::rax);
         fn_asm->sub(Xbyak::util::rbx, 8);
         break;
@@ -540,12 +616,19 @@ void wasm_to_x86_loop(Code* fn_asm, int function_index, WasmModule& module) {
       case WASM_OP_I32_LOAD16_S: {
         uint32_t align = RD_U32();
         uint32_t offset = RD_U32();
-        fn_asm->mov(Xbyak::util::r13, (uintptr_t)mem_base_ptr);
         fn_asm->mov(Xbyak::util::r14, Xbyak::util::ptr [Xbyak::util::rbx + 8]);
         fn_asm->add(Xbyak::util::rbx, 8);
+        fn_asm->add(Xbyak::util::r14d, offset);
+        fn_asm->jc(error_labels[function_index], fn_asm->T_NEAR);
+        fn_asm->mov(Xbyak::util::r15, (uintptr_t)mem_size);
+        fn_asm->mov(Xbyak::util::r15, Xbyak::util::qword [Xbyak::util::r15]);
+        fn_asm->sub(Xbyak::util::r15, 2);
+        fn_asm->cmp(Xbyak::util::r14d, Xbyak::util::r15d);
+        fn_asm->ja(error_labels[function_index], fn_asm->T_NEAR);
+        fn_asm->mov(Xbyak::util::r13, (uintptr_t)mem_base_ptr);
         fn_asm->add(Xbyak::util::r13, Xbyak::util::r14);
         fn_asm->mov(Xbyak::util::rax, 0);
-        fn_asm->mov(Xbyak::util::ax, Xbyak::util::word [Xbyak::util::r13 + offset]);
+        fn_asm->mov(Xbyak::util::ax, Xbyak::util::word [Xbyak::util::r13]);
         fn_asm->cwde();
         fn_asm->mov(Xbyak::util::qword [Xbyak::util::rbx], Xbyak::util::rax);
         fn_asm->sub(Xbyak::util::rbx, 8);
@@ -554,12 +637,19 @@ void wasm_to_x86_loop(Code* fn_asm, int function_index, WasmModule& module) {
       case WASM_OP_I32_LOAD16_U: {
         uint32_t align = RD_U32();
         uint32_t offset = RD_U32();
-        fn_asm->mov(Xbyak::util::r13, (uintptr_t)mem_base_ptr);
         fn_asm->mov(Xbyak::util::r14, Xbyak::util::ptr [Xbyak::util::rbx + 8]);
         fn_asm->add(Xbyak::util::rbx, 8);
+        fn_asm->add(Xbyak::util::r14d, offset);
+        fn_asm->jc(error_labels[function_index], fn_asm->T_NEAR);
+        fn_asm->mov(Xbyak::util::r15, (uintptr_t)mem_size);
+        fn_asm->mov(Xbyak::util::r15, Xbyak::util::qword [Xbyak::util::r15]);
+        fn_asm->sub(Xbyak::util::r15, 2);
+        fn_asm->cmp(Xbyak::util::r14d, Xbyak::util::r15d);
+        fn_asm->ja(error_labels[function_index], fn_asm->T_NEAR);
+        fn_asm->mov(Xbyak::util::r13, (uintptr_t)mem_base_ptr);
         fn_asm->add(Xbyak::util::r13, Xbyak::util::r14);
         fn_asm->mov(Xbyak::util::rax, 0);
-        fn_asm->mov(Xbyak::util::ax, Xbyak::util::word [Xbyak::util::r13 + offset]);
+        fn_asm->mov(Xbyak::util::ax, Xbyak::util::word [Xbyak::util::r13]);
         fn_asm->mov(Xbyak::util::qword [Xbyak::util::rbx], Xbyak::util::rax);
         fn_asm->sub(Xbyak::util::rbx, 8);
         break;
@@ -567,11 +657,18 @@ void wasm_to_x86_loop(Code* fn_asm, int function_index, WasmModule& module) {
       case WASM_OP_I32_LOAD: {
         uint32_t align = RD_U32();
         uint32_t offset = RD_U32();
-        fn_asm->mov(Xbyak::util::r13, (uintptr_t)mem_base_ptr);
         fn_asm->mov(Xbyak::util::r14, Xbyak::util::ptr [Xbyak::util::rbx + 8]);
         fn_asm->add(Xbyak::util::rbx, 8);
+        fn_asm->add(Xbyak::util::r14d, offset);
+        fn_asm->jc(error_labels[function_index], fn_asm->T_NEAR);
+        fn_asm->mov(Xbyak::util::r15, (uintptr_t)mem_size);
+        fn_asm->mov(Xbyak::util::r15, Xbyak::util::qword [Xbyak::util::r15]);
+        fn_asm->sub(Xbyak::util::r15, 4);
+        fn_asm->cmp(Xbyak::util::r14d, Xbyak::util::r15d);
+        fn_asm->ja(error_labels[function_index], fn_asm->T_NEAR);
+        fn_asm->mov(Xbyak::util::r13, (uintptr_t)mem_base_ptr);
         fn_asm->add(Xbyak::util::r13, Xbyak::util::r14);
-        fn_asm->mov(Xbyak::util::r13d, Xbyak::util::dword [Xbyak::util::r13 + offset]);
+        fn_asm->mov(Xbyak::util::r13d, Xbyak::util::dword [Xbyak::util::r13]);
         fn_asm->mov(Xbyak::util::qword [Xbyak::util::rbx], Xbyak::util::r13);
         fn_asm->sub(Xbyak::util::rbx, 8);
         break;
@@ -579,37 +676,55 @@ void wasm_to_x86_loop(Code* fn_asm, int function_index, WasmModule& module) {
       case WASM_OP_I32_STORE8: {
         uint32_t align = RD_U32();
         uint32_t offset = RD_U32();
+        fn_asm->mov(Xbyak::util::r14, Xbyak::util::ptr [Xbyak::util::rbx + 16]);
+        fn_asm->add(Xbyak::util::r14d, offset);
+        fn_asm->jc(error_labels[function_index], fn_asm->T_NEAR);
+        fn_asm->mov(Xbyak::util::r15, (uintptr_t)mem_size);
+        fn_asm->mov(Xbyak::util::r15, Xbyak::util::qword [Xbyak::util::r15]);
+        fn_asm->sub(Xbyak::util::r15, 1);
+        fn_asm->cmp(Xbyak::util::r14d, Xbyak::util::r15d);
+        fn_asm->ja(error_labels[function_index], fn_asm->T_NEAR);
         fn_asm->mov(Xbyak::util::r13, (uintptr_t)mem_base_ptr);
-        fn_asm->mov(Xbyak::util::r14, Xbyak::util::ptr [Xbyak::util::rbx + 16]); // Address
+        fn_asm->add(Xbyak::util::r13, Xbyak::util::r14);
         fn_asm->mov(Xbyak::util::r15, Xbyak::util::ptr [Xbyak::util::rbx + 8]); // Value
         fn_asm->add(Xbyak::util::rbx, 16); 
-        fn_asm->add(Xbyak::util::r13, Xbyak::util::r14);
-        fn_asm->mov(Xbyak::util::byte [Xbyak::util::r13 + offset], Xbyak::util::r15b);
-        fn_asm->sub(Xbyak::util::rbx, 8);
+        fn_asm->mov(Xbyak::util::byte [Xbyak::util::r13], Xbyak::util::r15b);
         break;
       }
       case WASM_OP_I32_STORE16: {
         uint32_t align = RD_U32();
         uint32_t offset = RD_U32();
+        fn_asm->mov(Xbyak::util::r14, Xbyak::util::ptr [Xbyak::util::rbx + 16]);
+        fn_asm->add(Xbyak::util::r14d, offset);
+        fn_asm->jc(error_labels[function_index], fn_asm->T_NEAR);
+        fn_asm->mov(Xbyak::util::r15, (uintptr_t)mem_size);
+        fn_asm->mov(Xbyak::util::r15, Xbyak::util::qword [Xbyak::util::r15]);
+        fn_asm->sub(Xbyak::util::r15, 2);
+        fn_asm->cmp(Xbyak::util::r14d, Xbyak::util::r15d);
+        fn_asm->ja(error_labels[function_index], fn_asm->T_NEAR);
         fn_asm->mov(Xbyak::util::r13, (uintptr_t)mem_base_ptr);
-        fn_asm->mov(Xbyak::util::r14, Xbyak::util::ptr [Xbyak::util::rbx + 16]); // Address
+        fn_asm->add(Xbyak::util::r13, Xbyak::util::r14);
         fn_asm->mov(Xbyak::util::r15, Xbyak::util::ptr [Xbyak::util::rbx + 8]); // Value
         fn_asm->add(Xbyak::util::rbx, 16); 
-        fn_asm->add(Xbyak::util::r13, Xbyak::util::r14);
-        fn_asm->mov(Xbyak::util::word [Xbyak::util::r13 + offset], Xbyak::util::r15w);
-        fn_asm->sub(Xbyak::util::rbx, 8);
+        fn_asm->mov(Xbyak::util::word [Xbyak::util::r13], Xbyak::util::r15w);
         break;
       }
       case WASM_OP_I32_STORE: {
         uint32_t align = RD_U32();
         uint32_t offset = RD_U32();
+        fn_asm->mov(Xbyak::util::r14, Xbyak::util::ptr [Xbyak::util::rbx + 16]);
+        fn_asm->add(Xbyak::util::r14d, offset);
+        fn_asm->jc(error_labels[function_index], fn_asm->T_NEAR);
+        fn_asm->mov(Xbyak::util::r15, (uintptr_t)mem_size);
+        fn_asm->mov(Xbyak::util::r15, Xbyak::util::qword [Xbyak::util::r15]);
+        fn_asm->sub(Xbyak::util::r15, 4);
+        fn_asm->cmp(Xbyak::util::r14d, Xbyak::util::r15d);
+        fn_asm->ja(error_labels[function_index], fn_asm->T_NEAR);
         fn_asm->mov(Xbyak::util::r13, (uintptr_t)mem_base_ptr);
-        fn_asm->mov(Xbyak::util::r14, Xbyak::util::ptr [Xbyak::util::rbx + 16]); // Address
+        fn_asm->add(Xbyak::util::r13, Xbyak::util::r14);
         fn_asm->mov(Xbyak::util::r15, Xbyak::util::ptr [Xbyak::util::rbx + 8]); // Value
         fn_asm->add(Xbyak::util::rbx, 16); 
-        fn_asm->add(Xbyak::util::r13, Xbyak::util::r14);
-        fn_asm->mov(Xbyak::util::dword [Xbyak::util::r13 + offset], Xbyak::util::r15);
-        fn_asm->sub(Xbyak::util::rbx, 8);
+        fn_asm->mov(Xbyak::util::dword [Xbyak::util::r13], Xbyak::util::r15d);
         break;
       }
       case WASM_OP_I32_ADD: {
@@ -639,6 +754,8 @@ void wasm_to_x86_loop(Code* fn_asm, int function_index, WasmModule& module) {
       case WASM_OP_I32_DIV_S: {
         fn_asm->mov(Xbyak::util::eax, Xbyak::util::dword [Xbyak::util::rbx + 16]);
         fn_asm->cdq();
+        fn_asm->cmp(Xbyak::util::qword [Xbyak::util::rbx + 8], 0);
+        fn_asm->je(error_labels[function_index], fn_asm->T_NEAR);
         fn_asm->idiv(Xbyak::util::dword [Xbyak::util::rbx + 8]);
         fn_asm->add(Xbyak::util::rbx, 16);
         fn_asm->mov(Xbyak::util::qword [Xbyak::util::rbx], Xbyak::util::eax);
@@ -648,6 +765,8 @@ void wasm_to_x86_loop(Code* fn_asm, int function_index, WasmModule& module) {
       case WASM_OP_I32_DIV_U: {
         fn_asm->mov(Xbyak::util::eax, Xbyak::util::dword [Xbyak::util::rbx + 16]);
         fn_asm->mov(Xbyak::util::edx, 0);
+        fn_asm->cmp(Xbyak::util::qword [Xbyak::util::rbx + 8], 0);
+        fn_asm->je(error_labels[function_index], fn_asm->T_NEAR);
         fn_asm->div(Xbyak::util::dword [Xbyak::util::rbx + 8]);
         fn_asm->add(Xbyak::util::rbx, 16);
         fn_asm->mov(Xbyak::util::qword [Xbyak::util::rbx], Xbyak::util::eax);
@@ -657,6 +776,8 @@ void wasm_to_x86_loop(Code* fn_asm, int function_index, WasmModule& module) {
       case WASM_OP_I32_REM_S: {
         fn_asm->mov(Xbyak::util::eax, Xbyak::util::dword [Xbyak::util::rbx + 16]);
         fn_asm->cdq();
+        fn_asm->cmp(Xbyak::util::qword [Xbyak::util::rbx + 8], 0);
+        fn_asm->je(error_labels[function_index], fn_asm->T_NEAR);
         fn_asm->idiv(Xbyak::util::dword [Xbyak::util::rbx + 8]);
         fn_asm->add(Xbyak::util::rbx, 16);
         fn_asm->mov(Xbyak::util::qword [Xbyak::util::rbx], Xbyak::util::edx);
@@ -666,6 +787,8 @@ void wasm_to_x86_loop(Code* fn_asm, int function_index, WasmModule& module) {
       case WASM_OP_I32_REM_U: {
         fn_asm->mov(Xbyak::util::eax, Xbyak::util::dword [Xbyak::util::rbx + 16]);
         fn_asm->mov(Xbyak::util::edx, 0);
+        fn_asm->cmp(Xbyak::util::qword [Xbyak::util::rbx + 8], 0);
+        fn_asm->je(error_labels[function_index], fn_asm->T_NEAR);
         fn_asm->div(Xbyak::util::dword [Xbyak::util::rbx + 8]);
         fn_asm->add(Xbyak::util::rbx, 16);
         fn_asm->mov(Xbyak::util::qword [Xbyak::util::rbx], Xbyak::util::edx);
@@ -755,10 +878,10 @@ void wasm_to_x86_loop(Code* fn_asm, int function_index, WasmModule& module) {
       case WASM_OP_I32_EQZ: {
         fn_asm->mov(Xbyak::util::r14, 0);
         fn_asm->mov(Xbyak::util::r15, 1);
-        fn_asm->mov(Xbyak::util::r13, Xbyak::util::ptr [Xbyak::util::rbx + 16]);
+        fn_asm->mov(Xbyak::util::r13, Xbyak::util::ptr [Xbyak::util::rbx + 8]);
         fn_asm->cmp(Xbyak::util::r13, Xbyak::util::r14);
         fn_asm->cmove(Xbyak::util::r14, Xbyak::util::r15);
-        fn_asm->add(Xbyak::util::rbx, 16);
+        fn_asm->add(Xbyak::util::rbx, 8);
         fn_asm->mov(Xbyak::util::qword [Xbyak::util::rbx], Xbyak::util::r14);
         fn_asm->sub(Xbyak::util::rbx, 8);
         break;
@@ -876,6 +999,13 @@ void wasm_to_x86_loop(Code* fn_asm, int function_index, WasmModule& module) {
         fn_asm->sub(Xbyak::util::rbx, 8);
         break;
       }
+      case WASM_OP_I32_POPCNT: {
+        fn_asm->popcnt(Xbyak::util::r13d, Xbyak::util::dword [Xbyak::util::rbx + 8]);
+        fn_asm->add(Xbyak::util::rbx, 8);
+        fn_asm->mov(Xbyak::util::qword [Xbyak::util::rbx], Xbyak::util::r13);
+        fn_asm->sub(Xbyak::util::rbx, 8);
+        break;
+      }
       case WASM_OP_I32_EXTEND16_S: {
         fn_asm->mov(Xbyak::util::r13w, Xbyak::util::word [Xbyak::util::rbx + 8]);
         fn_asm->movsx(Xbyak::util::r13d, Xbyak::util::r13w);
@@ -901,19 +1031,37 @@ void wasm_to_x86_loop(Code* fn_asm, int function_index, WasmModule& module) {
         fn_asm->sub(Xbyak::util::rbx, 8);
         break;
       }
+      case WASM_OP_I32_TRUNC_F64_S: {
+        fn_asm->movsd(Xbyak::util::xmm0, Xbyak::util::qword [Xbyak::util::rbx + 8]);
+        fn_asm->cvttsd2si(Xbyak::util::rax, Xbyak::util::xmm0);
+        fn_asm->cmp(Xbyak::util::rax, 2147483647);
+        fn_asm->jg(error_labels[function_index], fn_asm->T_NEAR);
+        fn_asm->cmp(Xbyak::util::rax, -2147483648);
+        fn_asm->jl(error_labels[function_index], fn_asm->T_NEAR);
+        fn_asm->mov(Xbyak::util::qword [Xbyak::util::rbx + 8], Xbyak::util::rax);
+        break;
+      }
+      case WASM_OP_I32_TRUNC_F64_U: {
+        fn_asm->movsd(Xbyak::util::xmm0, Xbyak::util::qword [Xbyak::util::rbx + 8]);
+        fn_asm->cvttsd2si(Xbyak::util::rax, Xbyak::util::xmm0);
+        fn_asm->test(Xbyak::util::rax, Xbyak::util::rax);
+        fn_asm->js(error_labels[function_index], fn_asm->T_NEAR);
+        fn_asm->cmp(Xbyak::util::rax, 0xFFFFFFFF);
+        fn_asm->ja(error_labels[function_index], fn_asm->T_NEAR);
+        fn_asm->mov(Xbyak::util::qword [Xbyak::util::rbx + 8], Xbyak::util::rax);
+        break;
+      }
       case WASM_OP_F64_CONVERT_I32_S: {
         fn_asm->mov(Xbyak::util::r13d, Xbyak::util::dword [Xbyak::util::rbx + 8]);
         fn_asm->movsxd(Xbyak::util::r13, Xbyak::util::r13d);
         fn_asm->cvtsi2sd(Xbyak::util::xmm0, Xbyak::util::r13);
-        fn_asm->movsd(Xbyak::util::qword [Xbyak::util::rbx], Xbyak::util::xmm0);
-        fn_asm->sub(Xbyak::util::rbx, 8);
+        fn_asm->movsd(Xbyak::util::qword [Xbyak::util::rbx + 8], Xbyak::util::xmm0);
         break;
       }
       case WASM_OP_F64_CONVERT_I32_U: {
         fn_asm->mov(Xbyak::util::r13d, Xbyak::util::dword [Xbyak::util::rbx + 8]);
         fn_asm->cvtsi2sd(Xbyak::util::xmm0, Xbyak::util::r13);
-        fn_asm->movsd(Xbyak::util::qword [Xbyak::util::rbx], Xbyak::util::xmm0);
-        fn_asm->sub(Xbyak::util::rbx, 8);
+        fn_asm->movsd(Xbyak::util::qword [Xbyak::util::rbx + 8], Xbyak::util::xmm0);
         break;
       }
       case WASM_OP_F64_ADD: {
@@ -952,6 +1100,67 @@ void wasm_to_x86_loop(Code* fn_asm, int function_index, WasmModule& module) {
         fn_asm->sub(Xbyak::util::rbx, 8);
         break;
       } 
+      case WASM_OP_F64_ABS: {
+        fn_asm->movsd(Xbyak::util::xmm0, Xbyak::util::qword [Xbyak::util::rbx + 8]);
+        fn_asm->mov(Xbyak::util::r13, 0x7FFFFFFFFFFFFFFF);
+        fn_asm->movq(Xbyak::util::xmm2, Xbyak::util::r13);
+        fn_asm->andpd(Xbyak::util::xmm0, Xbyak::util::xmm2);
+        fn_asm->movsd(Xbyak::util::qword [Xbyak::util::rbx + 8], Xbyak::util::xmm0);
+        break;
+      }
+      case WASM_OP_F64_NEG: {
+        fn_asm->movsd(Xbyak::util::xmm0, Xbyak::util::qword [Xbyak::util::rbx + 8]);
+        fn_asm->mov(Xbyak::util::r13, 0x8000000000000000);
+        fn_asm->movq(Xbyak::util::xmm2, Xbyak::util::r13);
+        fn_asm->xorpd(Xbyak::util::xmm0, Xbyak::util::xmm2);
+        fn_asm->movsd(Xbyak::util::qword [Xbyak::util::rbx + 8], Xbyak::util::xmm0);
+        break;
+      }
+      case WASM_OP_F64_CEIL: {
+        fn_asm->movsd(Xbyak::util::xmm0, Xbyak::util::qword [Xbyak::util::rbx + 8]);
+        fn_asm->roundsd(Xbyak::util::xmm0, Xbyak::util::xmm0, 2); 
+        fn_asm->movsd(Xbyak::util::qword [Xbyak::util::rbx + 8], Xbyak::util::xmm0);
+        break;
+      }
+      case WASM_OP_F64_FLOOR: {
+        fn_asm->movsd(Xbyak::util::xmm0, Xbyak::util::qword [Xbyak::util::rbx + 8]);
+        fn_asm->roundsd(Xbyak::util::xmm0, Xbyak::util::xmm0, 9); 
+        fn_asm->movsd(Xbyak::util::qword [Xbyak::util::rbx + 8], Xbyak::util::xmm0);
+        break;
+      }
+      case WASM_OP_F64_TRUNC: {
+        fn_asm->movsd(Xbyak::util::xmm0, Xbyak::util::qword [Xbyak::util::rbx + 8]);
+        fn_asm->roundsd(Xbyak::util::xmm0, Xbyak::util::xmm0, 3); 
+        fn_asm->movsd(Xbyak::util::qword [Xbyak::util::rbx + 8], Xbyak::util::xmm0);
+        break;
+      }
+      case WASM_OP_F64_NEAREST: {
+        fn_asm->movsd(Xbyak::util::xmm0, Xbyak::util::qword [Xbyak::util::rbx + 8]);
+        fn_asm->roundsd(Xbyak::util::xmm0, Xbyak::util::xmm0, 0); 
+        fn_asm->movsd(Xbyak::util::qword [Xbyak::util::rbx + 8], Xbyak::util::xmm0);
+        break;
+      }
+      case WASM_OP_F64_SQRT: {
+        fn_asm->movsd(Xbyak::util::xmm0, Xbyak::util::qword [Xbyak::util::rbx + 8]);
+        fn_asm->sqrtsd(Xbyak::util::xmm0, Xbyak::util::xmm0);
+        fn_asm->movsd(Xbyak::util::qword [Xbyak::util::rbx + 8], Xbyak::util::xmm0);
+        break;
+      }
+      case WASM_OP_F64_COPYSIGN: {
+        fn_asm->movsd(Xbyak::util::xmm0, Xbyak::util::qword [Xbyak::util::rbx + 8]);
+        fn_asm->movsd(Xbyak::util::xmm1, Xbyak::util::qword [Xbyak::util::rbx + 16]);
+        fn_asm->mov(Xbyak::util::r13, 0x8000000000000000);
+        fn_asm->movq(Xbyak::util::xmm2, Xbyak::util::r13);
+        fn_asm->mov(Xbyak::util::r13, 0x7FFFFFFFFFFFFFFF);
+        fn_asm->movq(Xbyak::util::xmm3, Xbyak::util::r13);
+        fn_asm->andpd(Xbyak::util::xmm0, Xbyak::util::xmm2);
+        fn_asm->andpd(Xbyak::util::xmm1, Xbyak::util::xmm3);
+        fn_asm->orpd(Xbyak::util::xmm0, Xbyak::util::xmm1);
+        fn_asm->add(Xbyak::util::rbx, 16);
+        fn_asm->movsd(Xbyak::util::qword [Xbyak::util::rbx], Xbyak::util::xmm0);
+        fn_asm->sub(Xbyak::util::rbx, 8);
+        break;
+      }
       case WASM_OP_F64_MAX: {
         fn_asm->movsd(Xbyak::util::xmm0, Xbyak::util::qword [Xbyak::util::rbx + 16]);
         fn_asm->movsd(Xbyak::util::xmm1, Xbyak::util::qword [Xbyak::util::rbx + 8]);
@@ -1045,23 +1254,36 @@ void wasm_to_x86_loop(Code* fn_asm, int function_index, WasmModule& module) {
       case WASM_OP_F64_STORE: {
         uint32_t align = RD_U32();
         uint32_t offset = RD_U32();
+        fn_asm->mov(Xbyak::util::r14, Xbyak::util::ptr [Xbyak::util::rbx + 16]);
+        fn_asm->add(Xbyak::util::r14d, offset);
+        fn_asm->jc(error_labels[function_index], fn_asm->T_NEAR);
+        fn_asm->mov(Xbyak::util::r15, (uintptr_t)mem_size);
+        fn_asm->mov(Xbyak::util::r15, Xbyak::util::qword [Xbyak::util::r15]);
+        fn_asm->sub(Xbyak::util::r15, 8);
+        fn_asm->cmp(Xbyak::util::r14d, Xbyak::util::r15d);
+        fn_asm->ja(error_labels[function_index], fn_asm->T_NEAR);
         fn_asm->mov(Xbyak::util::r13, (uintptr_t)mem_base_ptr);
-        fn_asm->mov(Xbyak::util::r14, Xbyak::util::ptr [Xbyak::util::rbx + 16]); // Address
+        fn_asm->add(Xbyak::util::r13, Xbyak::util::r14);
         fn_asm->mov(Xbyak::util::r15, Xbyak::util::ptr [Xbyak::util::rbx + 8]); // Value
         fn_asm->add(Xbyak::util::rbx, 16); 
-        fn_asm->add(Xbyak::util::r13, Xbyak::util::r14);
-        fn_asm->mov(Xbyak::util::qword [Xbyak::util::r13 + offset], Xbyak::util::r15);
-        fn_asm->sub(Xbyak::util::rbx, 8);        
+        fn_asm->mov(Xbyak::util::qword[Xbyak::util::r13], Xbyak::util::r15);
         break;
       } 
       case WASM_OP_F64_LOAD: {
         uint32_t align = RD_U32();
         uint32_t offset = RD_U32();
-        fn_asm->mov(Xbyak::util::r13, (uintptr_t)mem_base_ptr);
         fn_asm->mov(Xbyak::util::r14, Xbyak::util::ptr [Xbyak::util::rbx + 8]);
         fn_asm->add(Xbyak::util::rbx, 8);
+        fn_asm->add(Xbyak::util::r14d, offset);
+        fn_asm->jc(error_labels[function_index]);
+        fn_asm->mov(Xbyak::util::r15, (uintptr_t)mem_size);
+        fn_asm->mov(Xbyak::util::r15, Xbyak::util::qword [Xbyak::util::r15]);
+        fn_asm->sub(Xbyak::util::r15, 8);
+        fn_asm->cmp(Xbyak::util::r14d, Xbyak::util::r15d);
+        fn_asm->ja(error_labels[function_index]);
+        fn_asm->mov(Xbyak::util::r13, (uintptr_t)mem_base_ptr);
         fn_asm->add(Xbyak::util::r13, Xbyak::util::r14);
-        fn_asm->mov(Xbyak::util::r13, Xbyak::util::qword [Xbyak::util::r13 + offset]);
+        fn_asm->mov(Xbyak::util::r13, Xbyak::util::qword [Xbyak::util::r13]);
         fn_asm->mov(Xbyak::util::qword [Xbyak::util::rbx], Xbyak::util::r13);
         fn_asm->sub(Xbyak::util::rbx, 8);
         break;
@@ -1070,7 +1292,7 @@ void wasm_to_x86_loop(Code* fn_asm, int function_index, WasmModule& module) {
         uint32_t idx = RD_U32();
         fn_asm->mov(Xbyak::util::r13, (uintptr_t)globals);
         fn_asm->mov(Xbyak::util::r13, Xbyak::util::qword[Xbyak::util::r13 + idx * 8]);
-        fn_asm->mov(Xbyak::qword [Xbyak::util::rbx], Xbyak::util::r13);
+        fn_asm->mov(Xbyak::util::qword [Xbyak::util::rbx], Xbyak::util::r13);
         fn_asm->sub(Xbyak::util::rbx, 8);
         break;
       }
@@ -1080,7 +1302,11 @@ void wasm_to_x86_loop(Code* fn_asm, int function_index, WasmModule& module) {
         fn_asm->add(Xbyak::util::rbx, 8);
         fn_asm->mov(Xbyak::util::r14, (uintptr_t)globals);
         fn_asm->lea(Xbyak::util::r14, Xbyak::util::qword [Xbyak::util::r14 + idx * 8]);
-        fn_asm->mov(Xbyak::util::r14, Xbyak::util::qword [Xbyak::util::r13]);
+        fn_asm->mov(Xbyak::util::qword [Xbyak::util::r14], Xbyak::util::r13);
+        break;
+      }
+      case WASM_OP_DROP: {
+        fn_asm->add(Xbyak::util::rbx, 8);
         break;
       }
       default: {
@@ -1090,9 +1316,6 @@ void wasm_to_x86_loop(Code* fn_asm, int function_index, WasmModule& module) {
   }
 }
 
-// RBX will store VFP. We will increment the VFP and load/store from there to push/pop off the stack. 
-// R12 will store the base of the local/argument area, and we will dynamically load from this address based on local.get constant. 
-// R13 is an intermediate register to take a local and then put it on the operand stack on VFP.
 static JitEntry compile_function(bool is_main_fn, Code* cb, int function_index, WasmModule& module, std::vector<std::string>& args) {
 
   using namespace Xbyak::util;
@@ -1106,14 +1329,36 @@ static JitEntry compile_function(bool is_main_fn, Code* cb, int function_index, 
   FILE* f = fopen("jit.bin", "wb");
   fwrite(cb->getCode(), 1, cb->getSize(), f);
   fclose(f);
-  TRACE("HERE!");
 
   return cb->getCode<JitEntry>();
 }
 
-void get_global_const(WasmModule& module, bytearr& global_bytes) {
-  for (instruction : global_bytes) {
-    if 
+uint64_t get_global_const(WasmModule& module, bytearr& global_bytes) {
+  buffer_t buf{
+    .start = global_bytes.data(),
+    .ptr   = global_bytes.data(),
+    .end   = global_bytes.data() + global_bytes.size(),
+  };
+
+  buf.ptr = buf.start;
+
+  while (buf.ptr != buf.end) {
+    auto opcode = RD_OPCODE();
+    switch (opcode) {
+      case WASM_OP_I32_CONST: {
+        uint64_t global = (uint64_t)RD_I32();
+        return global;
+      }
+      case WASM_OP_F64_CONST: {
+        uint64_t bits = RD_U64_RAW();            
+        double global;
+        memcpy(&global, &bits, sizeof(global));
+        return std::bit_cast<uint64_t>(global);
+      }
+      default: {
+        break;
+      }
+    }
   }
 }
 
@@ -1124,11 +1369,12 @@ void jit(WasmModule& module, std::vector<std::string>& args) {
     FuncDecl* main_fn = find_main_function(module);
     int main_fn_idx = module.getFuncIdx(main_fn);
 
+    mem_size = (uint32_t*)calloc(1, sizeof(int));
+
     if (module.getMemorySize() > 0) {
       auto mem_list = module.getMemory(0);
-      TRACE("Memory initial: %d!\n", mem_list->limits.initial);
-      TRACE("Memory max: %d!\n", mem_list->limits.max);
       mem_base_ptr = calloc(static_cast<size_t>(mem_list->limits.initial) * 65536, sizeof(char));
+      *mem_size = mem_list->limits.initial * 65536;
     } 
 
     if (module.getDataSize() > 0) {
@@ -1161,8 +1407,6 @@ void jit(WasmModule& module, std::vector<std::string>& args) {
       }
     }
 
-    TRACE("HERE!\n");
-
     for (int i = 0; i < module.Funcs().size(); i++) {
       Xbyak::Label new_label;
       function_header_labels.push_back(new_label);
@@ -1170,13 +1414,12 @@ void jit(WasmModule& module, std::vector<std::string>& args) {
       error_labels.push_back(new_error_label); 
     }
 
-
     fn_sig_id = (int*)calloc(module.Funcs().size(), sizeof(int));
     fn_entry_ptr = (const void**)calloc(module.Funcs().size(), sizeof(void*));
-    globals = (int*)calloc(module.Globals.size(), 8);
+    globals = (uint64_t*)calloc(module.Globals().size(), 8);
 
-    for (int i = 0; i < module.Gloabls.size(); i++) {
-      globals[i] = module.Globals[i];
+    for (int i = 0; i < module.Globals().size(); i++) {
+      globals[i] = get_global_const(module, module.Globals()[i].init_expr_bytes);
     }
 
     store_args(cb, main_fn_idx, module, args);
@@ -1193,20 +1436,13 @@ void jit(WasmModule& module, std::vector<std::string>& args) {
       setup_error_function(cb, i, module);
     }
 
-    TRACE("HERE1!\n");
-
     for (int i = 0; i < (int)module.Funcs().size(); i++) {
       fn_sig_id[i] = module.getSigIdx(module.getFunc(i)->sig);
     }
 
-    TRACE("HERE2!\n");
-
     for (int i = 0; i < (int)module.Funcs().size(); i++) {
-      TRACE("HERE3\n");
       const void* label_address = function_header_labels[i].getAddress();
-      TRACE("HERE4\n");
       fn_entry_ptr[i] = label_address;
-      TRACE("HERE5\n");
     }
 
     uint64_t result;

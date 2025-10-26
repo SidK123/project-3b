@@ -9,6 +9,7 @@ include_directories (inc .)
 # --- Main executable --- #
 add_executable (wasm-vm main.cpp)
 target_link_libraries (wasm-vm vm -lm)
+target_include_directories (vm PRIVATE "${CMAKE_SOURCE_DIR}/xbyak")
 
 add_custom_command(
   TARGET wasm-vm
